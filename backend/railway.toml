@@ -1,0 +1,20 @@
+# railway.toml
+
+[build]
+# Clean Python build
+buildCommand = """
+python -m pip install --upgrade pip &&
+pip install --no-cache-dir -r requirements.txt
+"""
+
+rootDirectory = "backend"
+
+[start]
+# Start FastAPI
+startCommand = "bash start.sh"
+port = "$PORT"
+serviceType = "web"
+
+[env]
+PYTHONUNBUFFERED = "1"
+PYTHONDONTWRITEBYTECODE = "1"
