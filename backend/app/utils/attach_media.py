@@ -1,10 +1,13 @@
 import json
 import os
 import re
+
+from dotenv import load_dotenv
 from openai import OpenAI
+
 from app.schema.exercise_media_map import EXERCISE_MEDIA_MAP
 
-client = OpenAI()
+load_dotenv()
 
 # Cache setup
 DATA_DIR = os.path.join(os.path.dirname(__file__), "../model_cache/data_store")
@@ -42,11 +45,34 @@ def find_exercise_media(name: str):
     return None  # no match found
 
 
+def _default_enrichment(name: str):
+    return {
+        "difficulty": "Beginner",
+        "body_part": "Full Body",
+        "target": "multiple muscles",
+        "rest": "1 minute",
+        "calories": "5 kcal per set",
+        "how_to_perform": [
+            f"Set up safely for {name}.",
+            "Perform each rep with control and full range.",
+            "Breathe consistently; stop if form breaks down.",
+        ],
+    }
+
+
 def enrich_exercise(name: str):
     """Get difficulty, rest, body_part, target, calories for exercise name."""
     norm = normalize_name(name)
     if norm in EXERCISE_CACHE:
         return EXERCISE_CACHE[norm]
+
+    # Offline / local mode: skip OpenAI enrichment
+    provider = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+    if provider in ("local", "demo"):
+        info = _default_enrichment(name)
+        EXERCISE_CACHE[norm] = info
+        save_cache()
+        return info
 
     prompt = f"""
     For exercise "{name}", return ONLY valid JSON with:
@@ -72,8 +98,8 @@ def enrich_exercise(name: str):
     }}
     """
 
-
     try:
+        client = OpenAI()
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -94,17 +120,9 @@ def enrich_exercise(name: str):
                 "Perform each rep slowly and with control.",
                 "Breathe consistently during the exercise."
             ])
-}
-
-
-    except Exception:
-        info = {
-            "difficulty": "Beginner",
-            "body_part": "Full Body",
-            "target": "multiple muscles",
-            "rest": "1 minute",
-            "calories": "5 kcal per set",
         }
+    except Exception:
+        info = _default_enrichment(name)
 
     EXERCISE_CACHE[norm] = info
     save_cache()
