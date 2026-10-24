@@ -3,9 +3,12 @@ import os
 
 class Settings(BaseSettings):
     DATABASE_URL: str = os.getenv("DATABASE_URL")
-    OPENAI_API_KEY: str
+    OPENAI_API_KEY: str = ""
     JWT_TOKEN_KEY: str
     ALGORITHM: str
+    LLM_PROVIDER: str = "openai"
+    OLLAMA_BASE_URL: str = "http://127.0.0.1:11434/v1"
+    OLLAMA_MODEL: str = "llama3.2"
     HF_HOME: str = "./model_cache"
     ALLOWED_ORIGINS: list = [
         "*",
@@ -19,5 +22,6 @@ class Settings(BaseSettings):
     
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 settings = Settings()

@@ -1,10 +1,26 @@
-from sqlalchemy.orm import Session # pyright: ignore[reportMissingImports]
+"""Conversation summary helpers for chat history."""
+
+import os
+
 from openai import OpenAI
-from app.database.models_chat import Conversation
+from sqlalchemy.orm import Session  # pyright: ignore[reportMissingImports]
+
 from app.database.crud_chat import get_messages_by_conversation_id
+from app.database.models_chat import Conversation
 
 
 def generate_and_update_summary(db: Session, conversation_id: int, model="gpt-4o"):
+    """
+    Build a conversation summary and persist it on the conversation row.
+
+    Args:
+        db: Active SQLAlchemy session.
+        conversation_id: ID of the conversation to summarize.
+        model: Model name used when summarizing via an external LLM.
+
+    Returns:
+        The summary string on success, otherwise None.
+    """
     # Fetch messages
     messages = get_messages_by_conversation_id(db, conversation_id)
     if not messages:
@@ -36,6 +52,12 @@ def summarize_messages(messages, model="gpt-4o"):
     # Use only the last 10 messages if more exist
     if len(messages) > 10:
         messages = messages[-10:]
+
+    provider = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+    if provider in ("local", "demo"):
+        # Lightweight offline summary for local mode
+        user_bits = [m.content[:120] for m in messages if getattr(m, "role", "") == "user"][-3:]
+        return " | ".join(user_bits) if user_bits else "Fitness conversation"
 
     client = OpenAI()
 
