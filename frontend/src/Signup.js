@@ -61,7 +61,7 @@ function Signup() {
                 WebkitTextFillColor: "transparent",
                 fontWeight: 700,
               }}>
-              Join Vektor.ai
+              Join Kinetic.AI
             </Title>
             <Text size="sm" color="dimmed">
               Create your account and start your journey

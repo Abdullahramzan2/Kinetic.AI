@@ -103,7 +103,7 @@ function Login() {
               Welcome Back
             </Title>
             <Text size="sm" color="dimmed">
-              Sign in to your Vektor.ai account
+              Sign in to your Kinetic.AI account
             </Text>
           </Box>
 

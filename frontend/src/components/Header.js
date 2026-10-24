@@ -69,7 +69,7 @@ function Header() {
             color: currentTheme === "dark" ? "#fff" : "#000",
             fontWeight: 600,
           }}>
-          Vektor.ai
+          Kinetic.AI
         </Title>
       </Group>
 
