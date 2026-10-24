@@ -1,17 +1,65 @@
-from fastapi import APIRouter, Depends, HTTPException # pyright: ignore[reportMissingImports]
-from sqlalchemy.orm import Session# pyright: ignore[reportMissingImports]
-from app.services.llm_service import LLMService
-from app.models.request_models import LLMRequest
+"""API routes for LLM fitness-plan generation."""
+
+import json
+from typing import Any, Dict, List, Optional
+
+from fastapi import (  # pyright: ignore[reportMissingImports]
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
+from sqlalchemy.orm import Session  # pyright: ignore[reportMissingImports]
+
 from app.database import crud_chat, models_chat
 from app.database.db_session import get_db
-from app.utils.summarize import generate_and_update_summary
-from app.utils.auth import oauth2_scheme, verify_token
+from app.models.request_models import LLMRequest
+from app.services.llm_service import LLMService
 from app.utils.attach_media import attach_media_and_enrich
-from typing import Optional
-import json, re
+from app.utils.auth import oauth2_scheme, verify_token
+from app.utils.summarize import generate_and_update_summary
 
 router = APIRouter()
 llm_service = LLMService()
+
+
+def _parse_assistant_content(assistant_content: Any) -> Dict[str, Any]:
+    """Normalize LLM output into a JSON-serializable dict."""
+    try:
+        if isinstance(assistant_content, dict):
+            text = assistant_content.get("text")
+            if isinstance(text, str):
+                try:
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    return assistant_content
+            return assistant_content
+        if isinstance(assistant_content, str):
+            return json.loads(assistant_content)
+        return {"text": str(assistant_content)}
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[error] Error parsing assistant_content: {exc}")
+        return {"error": f"Failed to parse response: {exc}"}
+
+
+def _build_history(
+    messages: List[models_chat.Message],
+    conversation: models_chat.Conversation,
+) -> List[Dict[str, str]]:
+    """Build chat history for the LLM from DB messages and summary."""
+    history = [{"role": m.role, "content": m.content} for m in messages]
+    if conversation.summary:
+        history.insert(
+            0,
+            {
+                "role": "assistant",
+                "content": (
+                    "Here is a summary of previous conversation:\n"
+                    f"{conversation.summary}"
+                ),
+            },
+        )
+    return history
 
 
 @router.post("/generate")
@@ -20,38 +68,54 @@ async def generate_response_stream(
     db: Session = Depends(get_db),
     token: str = Depends(oauth2_scheme),
 ):
+    """Generate a fitness plan reply, persist the turn, and return enriched JSON."""
     print("NEW LLM REQUEST")
 
-    # Verify token
     username = verify_token(token)
-    user = db.query(models_chat.Users).filter(models_chat.Users.username == username).first()
+    user = (
+        db.query(models_chat.Users)
+        .filter(models_chat.Users.username == username)
+        .first()
+    )
     if not user:
-        raise HTTPException(status=404, detail="User not found")
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
 
     user_id = user.id
     conv_id: Optional[int] = getattr(request, "conversation_id", None)
-    if not conv_id:
-        raise HTTPException(status=400, detail="conversation_id is required")
 
-    conversation = db.query(models_chat.Conversation).filter(
-        models_chat.Conversation.id == conv_id
-    ).first()
+    conversation = None
+    if conv_id:
+        conversation = (
+            db.query(models_chat.Conversation)
+            .filter(
+                models_chat.Conversation.id == conv_id,
+                models_chat.Conversation.user_id == user_id,
+            )
+            .first()
+        )
 
     if not conversation:
-        raise HTTPException(status=404, detail="Conversation not found")
+        conversation = crud_chat.create_conversation(
+            db,
+            title=request.new_title or "Fitness Plan",
+            user_id=user_id,
+            summary="",
+        )
+        conv_id = conversation.id
 
-    print(f"✅ Conversation {conv_id} verified for user {user_id}")
+    print(f"[ok] Conversation {conv_id} verified for user {user_id}")
 
-    # Save user message
-    user_msg = crud_chat.create_message(
+    crud_chat.create_message(
         db,
         conversation_id=conv_id,
         content=request.prompt,
-        role="user"
+        role="user",
     )
     db.commit()
 
-    # Get history
     messages = (
         db.query(models_chat.Message)
         .filter(models_chat.Message.conversation_id == conv_id)
@@ -60,15 +124,8 @@ async def generate_response_stream(
         .all()
     )
     messages = list(reversed(messages))
-    history = [{"role": m.role, "content": m.content} for m in messages]
+    history = _build_history(messages, conversation)
 
-    if conversation.summary:
-        history.insert(0, {
-            "role": "assistant",
-            "content": f"Here is a summary of previous conversation:\n{conversation.summary}"
-        })
-
-    # Get response from model
     assistant_content = llm_service.generate_chatgpt_response(
         prompt=request.prompt,
         history=history,
@@ -79,45 +136,25 @@ async def generate_response_stream(
         height_unit=request.height_unit,
     )
 
-    # Parse response safely
-    try:
-        if isinstance(assistant_content, dict):
-            if "text" in assistant_content and isinstance(assistant_content["text"], str):
-                try:
-                    parsed_response = json.loads(assistant_content["text"])
-                except json.JSONDecodeError:
-                    parsed_response = assistant_content
-            else:
-                parsed_response = assistant_content
-        elif isinstance(assistant_content, str):
-            parsed_response = json.loads(assistant_content)
-        else:
-            parsed_response = {"text": str(assistant_content)}
-    except Exception as e:
-        print(f"❌ Error parsing assistant_content: {e}")
-        parsed_response = {"error": f"Failed to parse response: {str(e)}"}
+    parsed_response = attach_media_and_enrich(
+        _parse_assistant_content(assistant_content)
+    )
 
-    # Attach exercise media to each exercise in the plan
-    parsed_response = attach_media_and_enrich(parsed_response)
-
-    # Save assistant reply
     crud_chat.create_message(
         db,
         conversation_id=conv_id,
         content=json.dumps(parsed_response),
-        role="assistant"
+        role="assistant",
     )
     db.commit()
 
-    # Update summary
     try:
         summary = generate_and_update_summary(db, conv_id)
         if summary:
-            print(f"✅ Summary updated for conversation {conv_id}")
-    except Exception as e:
-        print(f"❌ Error updating summary: {e}")
+            print(f"[ok] Summary updated for conversation {conv_id}")
+    except (RuntimeError, ValueError, TypeError) as exc:
+        print(f"[error] Error updating summary: {exc}")
 
-    # Return enriched response
     return {
         "conversation_id": conv_id,
         "response": parsed_response,

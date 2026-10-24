@@ -1,26 +1,91 @@
-from openai import OpenAI
-import os
-import json
+"""LLM provider service for fitness plan generation."""
+
 import logging
+import os
 import traceback
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
-from typing import List, Dict, Optional, Any
-from app.utils.helpers import stream_llm_response
+from openai import OpenAI
+
+from app.services.local_fitness_planner import generate_local_fitness_plan
+from app.utils.json_utils import try_parse_json
 from app.utils.system_message_fitness import FITNESS_SYSTEM_MESSAGE
 from app.utils.unit_normalisation_and_bmi import normalize_and_bmi
-from app.utils.json_utils import clean_json_response, try_parse_json
 
 logger = logging.getLogger(__name__)
 load_dotenv()
 
-class LLMService:
+
+def _append_bmi_context(  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    prompt: str,
+    weight_value: Optional[float],
+    weight_unit: Optional[str],
+    height_value: Optional[float],
+    height_unit: Optional[str],
+    height_extra_inches: Optional[float],
+) -> str:
+    """Append normalized BMI metrics to the user prompt when available."""
+    if not (weight_value and height_value):
+        return prompt
+
+    try:
+        bmi_context = normalize_and_bmi(
+            weight_value,
+            weight_unit or "kg",
+            height_value,
+            height_unit or "cm",
+            height_extra_inches,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning("BMI normalization failed: %s", exc)
+        return prompt
+
+    return (
+        f"{prompt}\n\nSystem-provided metrics:\n"
+        f"- Normalized Weight: {bmi_context.get('normalized_weight_kg')} kg\n"
+        f"- Normalized Height: {bmi_context.get('normalized_height_cm')} cm\n"
+        f"- BMI: {bmi_context.get('bmi')}\n"
+        f"- BMI Category: {bmi_context.get('bmi_category')}"
+    )
+
+
+class LLMService:  # pylint: disable=too-few-public-methods
+    """Generate fitness responses via local planner, Ollama, or OpenAI."""
+
     def __init__(self):
+        self.provider = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+        self.client = None
+        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.2")
+        self._configure_client()
+
+    def _configure_client(self) -> None:
+        """Initialize the provider client based on LLM_PROVIDER."""
+        if self.provider in ("local", "demo"):
+            logger.info("LLMService using local fitness planner (no OpenAI)")
+            return
+
+        if self.provider == "ollama":
+            base_url = os.getenv(
+                "OLLAMA_BASE_URL",
+                "http://127.0.0.1:11434/v1",
+            )
+            self.client = OpenAI(
+                base_url=base_url,
+                api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+            )
+            logger.info("LLMService using Ollama at %s", base_url)
+            return
+
         api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment variables")
+        if not api_key or api_key.startswith("sk-replace"):
+            raise ValueError(
+                "OPENAI_API_KEY not found. Set a real key, or set "
+                "LLM_PROVIDER=local in backend/.env"
+            )
         self.client = OpenAI(api_key=api_key)
 
-    def generate_chatgpt_response(
+    def generate_chatgpt_response(  # pylint: disable=too-many-arguments,too-many-positional-arguments
         self,
         prompt: str,
         model: str = "gpt-4o",
@@ -36,127 +101,97 @@ class LLMService:
         height_extra_inches: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
-        Generate a structured response using OpenAI GPT models, with optional BMI context
-        and auto-parsing of JSON-formatted responses.
+        Generate a structured fitness response.
+
+        Providers: local/demo (offline), ollama, openai.
         """
-        try:
-            logger.info(f"Generating response (model={model}, web_search={enable_web_search})")
-
-            # Build message history
-            messages: List[Dict[str, str]] = [{"role": "system", "content": system_message}]
-            if history:
-                messages.extend(history)
-
-            # BMI context if provided
-            bmi_context = {}
-            if weight_value and height_value:
-                try:
-                    bmi_context = normalize_and_bmi(
-                        weight_value, weight_unit or "kg",
-                        height_value, height_unit or "cm",
-                        height_extra_inches
-                    )
-                    logger.info(f"BMI context: {bmi_context}")
-                except Exception as e:
-                    logger.warning(f"BMI normalization failed: {e}")
-
-            # Append BMI details into the prompt for better fitness plan relevance
-            if bmi_context:
-                prompt = (
-                    f"{prompt}\n\nSystem-provided metrics:\n"
-                    f"- Normalized Weight: {bmi_context.get('normalized_weight_kg')} kg\n"
-                    f"- Normalized Height: {bmi_context.get('normalized_height_cm')} cm\n"
-                    f"- BMI: {bmi_context.get('bmi')}\n"
-                    f"- BMI Category: {bmi_context.get('bmi_category')}"
-                )
-
-            messages.append({"role": "user", "content": prompt})
-
-            # Call OpenAI Responses API
-            response = self.client.responses.create(
-                model=model,
-                input=messages,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
+        if enable_web_search:
+            logger.info(
+                "Web search requested; not supported by the current provider path"
             )
 
-            # Try direct structured output first
-            try:
-                if hasattr(response, "output_parsed") and response.output_parsed:
-                    parsed = response.output_parsed
-                    if hasattr(parsed, "model_dump"):
-                        return parsed.model_dump()
-                    if isinstance(parsed, dict):
-                        return parsed
-                    if isinstance(parsed, str):
-                        try:
-                            return json.loads(parsed)
-                        except json.JSONDecodeError:
-                            return {"text": parsed}
-                    return {"data": parsed}
-            except Exception:
-                logger.debug("output_parsed check failed, falling back to text extraction", exc_info=True)
+        try:
+            if self.provider in ("local", "demo"):
+                return generate_local_fitness_plan(
+                    prompt=prompt,
+                    weight_value=weight_value,
+                    weight_unit=weight_unit,
+                    height_value=height_value,
+                    height_unit=height_unit,
+                    height_extra_inches=height_extra_inches,
+                )
 
-            # Try output_text if available
-            try:
-                if hasattr(response, "output_text") and response.output_text:
-                    parsed = try_parse_json(response.output_text)
-                    if parsed is not None:
-                        return parsed
-                    return {"text": response.output_text}
-            except Exception:
-                logger.debug("response.output_text check failed; continuing", exc_info=True)
+            return self._generate_via_chat_api(
+                prompt=prompt,
+                model=model,
+                history=history,
+                system_message=system_message,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                enable_web_search=enable_web_search,
+                weight_value=weight_value,
+                weight_unit=weight_unit,
+                height_value=height_value,
+                height_unit=height_unit,
+                height_extra_inches=height_extra_inches,
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.error("LLM service error: %s", exc)
+            logger.error(traceback.format_exc())
+            return {"error": f"LLM service error: {exc}"}
 
-            # Fallback: iterate through response.output
-            try:
-                if hasattr(response, "output") and response.output:
-                    for block in response.output:
-                        content_list = None
-                        if isinstance(block, dict):
-                            content_list = block.get("content") or []
-                        else:
-                            content_list = getattr(block, "content", []) or []
+    def _generate_via_chat_api(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+        self,
+        prompt: str,
+        model: str,
+        history: Optional[List[Dict[str, str]]],
+        system_message: str,
+        max_tokens: int,
+        temperature: float,
+        enable_web_search: bool,
+        weight_value: Optional[float],
+        weight_unit: Optional[str],
+        height_value: Optional[float],
+        height_unit: Optional[str],
+        height_extra_inches: Optional[float],
+    ) -> Dict[str, Any]:
+        """Call OpenAI-compatible chat completions and parse JSON when possible."""
+        logger.info(
+            "Generating response (provider=%s, model=%s, web_search=%s)",
+            self.provider,
+            model,
+            enable_web_search,
+        )
 
-                        for piece in content_list:
-                            piece_type = None
-                            piece_text = None
+        messages: List[Dict[str, str]] = [
+            {"role": "system", "content": system_message}
+        ]
+        if history:
+            messages.extend(history)
 
-                            if isinstance(piece, dict):
-                                piece_type = piece.get("type")
-                                piece_text = piece.get("text") or piece.get("content") or None
-                                if piece_text is None and isinstance(piece.get("content"), str):
-                                    piece_text = piece.get("content")
-                            else:
-                                piece_type = getattr(piece, "type", None)
-                                piece_text = getattr(piece, "text", None) or getattr(piece, "value", None)
+        prompt = _append_bmi_context(
+            prompt,
+            weight_value,
+            weight_unit,
+            height_value,
+            height_unit,
+            height_extra_inches,
+        )
+        messages.append({"role": "user", "content": prompt})
 
-                            if piece_type in ("output_text", "output_text_delta", "message"):
-                                if hasattr(piece_text, "value"):
-                                    piece_text = piece_text.value
-                                if isinstance(piece_text, str):
-                                    parsed = try_parse_json(piece_text)
-                                    if parsed is not None:
-                                        return parsed
-                                    return {"text": piece_text}
-
-                        maybe_text = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
-                        if hasattr(maybe_text, "value"):
-                            maybe_text = maybe_text.value
-
-                        if isinstance(maybe_text, str) and maybe_text.strip():
-                            parsed = try_parse_json(maybe_text)
-                            if parsed is not None:
-                                return parsed
-                            return {"text": maybe_text}
-
-            except Exception:
-                logger.debug("Iterating response.output failed", exc_info=True)
-
-            # If no valid output was parsed
-            logger.error("No valid response content could be extracted from OpenAI response.")
+        use_model = self.ollama_model if self.provider == "ollama" else model
+        response = self.client.chat.completions.create(
+            model=use_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            logger.error(
+                "No valid response content could be extracted from LLM response."
+            )
             return {"error": "No valid response content."}
 
-        except Exception as e:
-            logger.error(f"LLM service error: {e}")
-            logger.error(traceback.format_exc())
-            return {"error": f"LLM service error: {str(e)}"}
+        parsed = try_parse_json(text)
+        return parsed if parsed is not None else {"text": text}
