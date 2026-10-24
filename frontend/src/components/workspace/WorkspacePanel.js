@@ -491,14 +491,18 @@ function WorkspacePanel({ workspaceContent }) {
                 }}>
                 {content.response &&
                 typeof content.response === "object" &&
-                !content.response.missing_info ? (
+                content.response.plans &&
+                content.response.plans.length > 0 &&
+                !content.response.missing_info &&
+                !content.response.error ? (
                   <FitnessPlanCard planData={content.response} theme={theme} />
                 ) : (
                   <Text
                     style={{ whiteSpace: "pre-wrap", color: theme.other.text }}>
-                    {typeof content.response === "object" &&
-                    content.response.missing_info
-                      ? content.response.missing_info
+                    {typeof content.response === "object"
+                      ? content.response.missing_info ||
+                        content.response.error ||
+                        JSON.stringify(content.response, null, 2)
                       : typeof content.response === "string"
                       ? content.response
                       : JSON.stringify(content.response, null, 2)}

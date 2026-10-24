@@ -12,6 +12,7 @@ function Home() {
   const [currentPrompt, setCurrentPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [workspaceContent, setWorkspaceContent] = useState([]);
+  const [conversationId, setConversationId] = useState(null);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -24,12 +25,14 @@ function Home() {
 
       try {
         const token = localStorage.getItem("token");
+        if (!token) {
+          throw new Error("Please log in first");
+        }
+
         const headers = {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
         };
-        if (token) {
-          headers["Authorization"] = `Bearer ${token}`;
-        }
 
         const response = await fetch(
           `${process.env.REACT_APP_APP_URL}/model/generate`,
@@ -38,20 +41,40 @@ function Home() {
             headers,
             body: JSON.stringify({
               prompt: promptToSend,
-              model: "gpt-4o",
-              conversation_id: 11,
+              model: "local",
+              conversation_id: conversationId || undefined,
             }),
           }
         );
 
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.ok) {
+          const errBody = await response.json().catch(() => ({}));
+          throw new Error(errBody.detail || `HTTP ${response.status}`);
+        }
 
         const data = await response.json();
 
-        setWorkspaceContent(prev => [...prev, data]);
+        if (data.conversation_id && !conversationId) {
+          setConversationId(data.conversation_id);
+        }
+
+        setWorkspaceContent((prev) => [...prev, data]);
+
+        // Show missing_info / errors in the chat as well
+        const plan = data.response;
+        if (plan && (plan.missing_info || plan.error)) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              text: plan.missing_info || plan.error,
+              type: "bot",
+              id: Date.now() + 1,
+            },
+          ]);
+        }
       } catch (error) {
         const errorMessage = {
-          text: "Error: Network issue - please try again",
+          text: `Error: ${error.message || "Network issue - please try again"}`,
           type: "bot",
           id: Date.now() + 1,
         };
